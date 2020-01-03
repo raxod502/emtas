@@ -62,6 +62,17 @@ latency somewhere in the ballpark of 100ms."
 See `emtas-idle-require'."
   :type 'file)
 
+(defcustom emtas-verbose nil
+  "Non-nil means to verbosely log debugging information.
+This may help you to understand what EMTAS is doing during
+startup."
+  :type 'boolean)
+
+(defun emtas--log (format-string &rest args)
+  "Like `message', but only if `emtas-verbose', and with a prefix."
+  (when emtas-verbose
+    (apply #'message (concat "EMTAS: " format-string) args)))
+
 (defvar emtas--cache-loaded nil
   "Non-nil means `emtas-cache-file' has been loaded.")
 
@@ -73,7 +84,7 @@ See `emtas-idle-require'."
 Currently this is just an alist mapping idle-required features to
 their transitive dependencies in reverse order.")
 
-(defvar emtas--idle-queue (make-heap (lambda (a b) (> (car a) (car b))))
+(defvar emtas--idle-queue (make-heap (lambda (a b) (< (car a) (car b))))
   "Priority queue of actions to perform. They have an arbitrary format.
 
 Invariant: this variable is non-nil if and only if there's an
@@ -99,7 +110,7 @@ idle timer scheduled to pop something off the queue.")
   "Hash table mapping features to lists of their dependencies.")
 
 (defun emtas--compute-dependencies (feature)
-  "Compute list of FEATURE's transitive dependencies in desired load order."
+  "Compute list of FEATURE's transitive dependencies in forward order."
   ;; Perfectly safe to use recursion here since if the load depth were
   ;; too large we'd have overflowed the stack while loading the code
   ;; in the first place!
@@ -119,6 +130,7 @@ idle timer scheduled to pop something off the queue.")
       (pcase (heap-delete-root emtas--idle-queue)
         (`nil
          (when (heap-empty emtas--idle-queue)
+           (emtas--log "write cache file")
            ;; Looks like we popped everything off the queue, so the
            ;; cache must be dirty (otherwise we'd not be in the loop).
            ;; Better write it to disk. Then we'll be done.
@@ -132,6 +144,7 @@ idle timer scheduled to pop something off the queue.")
            (setq emtas--cache-dirty nil)))
         (`(,_ . load-cache)
          (unless emtas--cache-loaded
+           (emtas--log "read cache file")
            (with-temp-buffer
              (ignore-errors
                (insert-file-contents-literally
@@ -142,21 +155,24 @@ idle timer scheduled to pop something off the queue.")
         (`(,_ . (idle-require ,feature))
          (if-let ((deps (alist-get feature emtas--cache)))
              (let ((idx 0))
+               (emtas--log "schedule reverse load of %S" feature)
                (dolist (dep deps)
                  (emtas--schedule-action
-                  `(dependency-require ,dep)
+                  `(require ,dep)
                   ;; This acts as a lexicographic sort assuming no
                   ;; instance of Emacs has more than a billion
                   ;; features available.
                   (+ (emtas--low-order 1) (* idx 1e-9)))
-                 (cl-incf idx))
-               (emtas--schedule-action
-                `(compute-dependencies ,feature)
-                (+ (emtas--low-order 1) (* idx 1e-9))))
+                 (cl-incf idx)))
+           (emtas--log "schedule discovery load of %S" feature)
            (emtas--schedule-action
             `(require ,feature)
-            (emtas--low-order 1))))
+            (emtas--low-order 1))
+           (emtas--schedule-action
+            `(compute-dependencies ,feature)
+            (emtas--low-order 2))))
         (`(,_ . (require ,feature))
+         (emtas--log "require %S" feature)
          (if emtas--require-instrumented-p
              (require feature)
            (cl-letf* ((require (symbol-function #'require))
@@ -169,6 +185,8 @@ idle timer scheduled to pop something off the queue.")
                              ;; Yes, it's okay to push onto a hash
                              ;; table entry that doesn't exist yet.
                              ;; You get a list with one element.
+                             (emtas--log "record dependency %S -> %S"
+                                         emtas--current-feature feature)
                              (push feature (gethash
                                             emtas--current-feature
                                             emtas--feature-dependencies)))
@@ -177,9 +195,11 @@ idle timer scheduled to pop something off the queue.")
              (let ((emtas--require-instrumented-p t))
                (require feature)))))
         (`(,_ . (compute-dependencies ,feature))
+         (emtas--log "compute dependencies of %S" feature)
          (setf (alist-get feature emtas--cache)
-               (emtas--compute-dependencies feature))
-         (setq emtas--cache-dirty t))))
+               (reverse (emtas--compute-dependencies feature)))
+         (setq emtas--cache-dirty t))
+        (action (error "unknown entry in action queue: %S" action))))
     (when (or (not (heap-empty emtas--idle-queue)) emtas--cache-dirty)
       (run-with-idle-timer
        emtas-idle-queue-delay
