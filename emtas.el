@@ -166,9 +166,9 @@ avoid infinite recursion."
                  (emtas--schedule-action
                   `(require ,dep)
                   ;; This acts as a lexicographic sort assuming no
-                  ;; instance of Emacs has more than a billion
+                  ;; instance of Emacs has more than a million
                   ;; features available.
-                  (+ (emtas--low-order 1) (* idx 1e-9)))
+                  (+ (emtas--low-order 1) (* idx 1e-6)))
                  (cl-incf idx)))
            (emtas--log "schedule discovery load of %S" feature)
            (emtas--schedule-action
