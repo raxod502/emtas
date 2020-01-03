@@ -95,7 +95,7 @@ idle timer scheduled to pop something off the queue.")
 
 (defun emtas--low-order (order)
   "Return an order value lower than any the user is allowed to provide."
-  (- order 1e7))
+  (- order 2000))
 
 (defvar emtas--idle-features-for-cache nil
   "List of features that should be written into the cache.")
@@ -109,16 +109,22 @@ idle timer scheduled to pop something off the queue.")
 (defvar emtas--feature-dependencies (make-hash-table :test #'eq)
   "Hash table mapping features to lists of their dependencies.")
 
-(defun emtas--compute-dependencies (feature)
-  "Compute list of FEATURE's transitive dependencies in forward order."
+(defun emtas--compute-dependencies (feature &optional table)
+  "Compute list of FEATURE's transitive dependencies in forward order.
+TABLE is a boolean hash table of features to ignore, used to
+avoid infinite recursion."
+  (setq table (or table (make-hash-table :test #'eq)))
   ;; Perfectly safe to use recursion here since if the load depth were
   ;; too large we'd have overflowed the stack while loading the code
   ;; in the first place!
-  (cons feature
-        (apply #'append
-               (mapcar
-                #'emtas--compute-dependencies
-                (gethash feature emtas--feature-dependencies)))))
+  (unless (gethash feature table)
+    (puthash feature t table)
+    (cons feature
+          (apply #'append
+                 (mapcar
+                  (lambda (feature)
+                    (emtas--compute-dependencies feature table))
+                  (gethash feature emtas--feature-dependencies))))))
 
 (defun emtas--pop-action-and-reschedule ()
   "Execute an action from the idle queue, and schedule another pop."
@@ -167,10 +173,10 @@ idle timer scheduled to pop something off the queue.")
            (emtas--log "schedule discovery load of %S" feature)
            (emtas--schedule-action
             `(require ,feature)
-            (emtas--low-order 1))
-           (emtas--schedule-action
-            `(compute-dependencies ,feature)
-            (emtas--low-order 2))))
+            (emtas--low-order 1)))
+         (emtas--schedule-action
+          `(compute-dependencies ,feature)
+          (emtas--low-order 2)))
         (`(,_ . (require ,feature))
          (emtas--log "require %S" feature)
          (if emtas--require-instrumented-p
@@ -178,20 +184,19 @@ idle timer scheduled to pop something off the queue.")
            (cl-letf* ((require (symbol-function #'require))
                       ((symbol-function #'require)
                        (lambda (feature &optional filename noerror)
-                         ;; Two scans of the `features' list, yes, but
-                         ;; it's "probably" not a bottleneck.
-                         (unless (featurep feature)
-                           (when emtas--current-feature
-                             ;; Yes, it's okay to push onto a hash
-                             ;; table entry that doesn't exist yet.
-                             ;; You get a list with one element.
-                             (emtas--log "record dependency %S -> %S"
-                                         emtas--current-feature feature)
-                             (push feature (gethash
-                                            emtas--current-feature
-                                            emtas--feature-dependencies)))
-                           (let ((emtas--current-feature feature))
-                             (funcall require feature filename noerror))))))
+                         (when emtas--current-feature
+                           ;; Yes, it's okay to push onto a hash table
+                           ;; entry that doesn't exist yet. You get a
+                           ;; list with one element.
+                           (emtas--log
+                            "record dependency %S -> %S"
+                            emtas--current-feature feature)
+                           (push feature
+                                 (gethash
+                                  emtas--current-feature
+                                  emtas--feature-dependencies)))
+                         (let ((emtas--current-feature feature))
+                           (funcall require feature filename noerror)))))
              (let ((emtas--require-instrumented-p t))
                (require feature)))))
         (`(,_ . (compute-dependencies ,feature))
@@ -226,12 +231,12 @@ dependency graph changes, this will be detected automatically
 within one restart of Emacs.
 
 Idle requires with a smaller ORDER (defaults to 0) will happen
-first. ORDER must be an integer between -1e6 and +1e6, as other
+first. ORDER must be an integer between -1000 and +1000, as other
 values are for internal use."
   (setq order (or order 0))
   (unless (and (integerp order)
-               (>= order -1e6)
-               (<= order +1e6))
+               (>= order -1000)
+               (<= order +1000))
     (error "EMTAS: illegal idle-require order: %S" order))
   (emtas--schedule-action 'load-cache (emtas--low-order 0))
   (emtas--schedule-action `(idle-require ,feature) (or order 0)))
