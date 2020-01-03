@@ -116,7 +116,7 @@ idle timer scheduled to pop something off the queue.")
     (while (and (or emtas--idle-queue emtas--cache-dirty)
                 (< (float-time (time-subtract (current-time) start-time))
                    emtas-idle-action-max-duration))
-      (pcase (queue-dequeue emtas--idle-queue)
+      (pcase (heap-delete-root emtas--idle-queue)
         (`nil
          (unless emtas--idle-queue
            ;; Looks like we popped everything off the queue, so the
@@ -130,7 +130,7 @@ idle timer scheduled to pop something off the queue.")
                    (print-length nil))
                (print emtas--cache (current-buffer))))
            (setq emtas--cache-dirty nil)))
-        (`(,order . load-cache)
+        (`(,_ . load-cache)
          (unless emtas--cache-loaded
            (with-temp-buffer
              (ignore-errors
@@ -139,12 +139,12 @@ idle timer scheduled to pop something off the queue.")
                (setq emtas--cache (read (current-buffer)))))
            (setq emtas--cache-loaded t)
            (setq emtas--cache-dirty nil)))
-        (`(,order . (idle-require ,feature))
+        (`(,_ . (idle-require ,feature))
          (if-let ((deps (alist-get feature emtas--cache)))
              (let ((idx 0))
                (dolist (dep deps)
                  (emtas--schedule-action
-                  `(dependency-require ,feature)
+                  `(dependency-require ,dep)
                   ;; This acts as a lexicographic sort assuming no
                   ;; instance of Emacs has more than a billion
                   ;; features available.
@@ -156,7 +156,7 @@ idle timer scheduled to pop something off the queue.")
            (emtas--schedule-action
             `(require ,feature)
             (emtas--low-order 1))))
-        (`(,order . (require ,feature))
+        (`(,_ . (require ,feature))
          (if emtas--require-instrumented-p
              (require feature)
            (cl-letf* ((require (symbol-function #'require))
@@ -176,7 +176,7 @@ idle timer scheduled to pop something off the queue.")
                              (funcall require feature filename noerror))))))
              (let ((emtas--require-instrumented-p t))
                (require feature)))))
-        (`(,order . (compute-dependencies ,feature))
+        (`(,_ . (compute-dependencies ,feature))
          (setf (alist-get feature emtas--cache)
                (emtas--compute-dependencies feature))
          (setq emtas--cache-dirty t))))
@@ -191,7 +191,7 @@ idle timer scheduled to pop something off the queue.")
     (run-with-idle-timer
      emtas-idle-queue-delay
      nil #'emtas--pop-action-and-reschedule))
-  (queue-enqueue emtas--idle-queue (cons order action)))
+  (heap-add emtas--idle-queue (cons order action)))
 
 (defun emtas-idle-require (feature &optional order)
   "Require FEATURE when idle, amortizing load time of dependencies.
