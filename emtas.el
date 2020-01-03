@@ -45,7 +45,7 @@
   :prefix "emtas-"
   :link '(url-link "https://github.com/raxod502/emtas"))
 
-(defcustom emtas-idle-queue-delay 0.1
+(defcustom emtas-idle-queue-delay 0.01
   "Number of seconds to wait between each idle action."
   :type 'number)
 
@@ -86,6 +86,29 @@ idle timer scheduled to pop something off the queue.")
   "Return an order value lower than any the user is allowed to provide."
   (- order 1e7))
 
+(defvar emtas--idle-features-for-cache nil
+  "List of features that should be written into the cache.")
+
+(defvar emtas--require-instrumented-p nil
+  "Non-nil means `require' has been instrumented by EMTAS.")
+
+(defvar emtas--current-feature nil
+  "Feature currently being required, a symbol.")
+
+(defvar emtas--feature-dependencies (make-hash-table :test #'eq)
+  "Hash table mapping features to lists of their dependencies.")
+
+(defun emtas--compute-dependencies (feature)
+  "Compute list of FEATURE's transitive dependencies in desired load order."
+  ;; Perfectly safe to use recursion here since if the load depth were
+  ;; too large we'd have overflowed the stack while loading the code
+  ;; in the first place!
+  (cons feature
+        (apply #'append
+               (mapcar
+                #'emtas--compute-dependencies
+                (gethash feature emtas--feature-dependencies)))))
+
 (defun emtas--pop-action-and-reschedule ()
   "Execute an action from the idle queue, and schedule another pop."
   (let ((emtas--inhibit-scheduling t)
@@ -125,13 +148,38 @@ idle timer scheduled to pop something off the queue.")
                   ;; This acts as a lexicographic sort assuming no
                   ;; instance of Emacs has more than a billion
                   ;; features available.
-                  (+ order (* idx 1e-9)))
-                 (queue-enqueue
-                  emtas--idle-queue `(dependency-require ,feature))
-                 (cl-incf idx)))
+                  (+ (emtas--low-order 1) (* idx 1e-9)))
+                 (cl-incf idx))
+               (emtas--schedule-action
+                `(compute-dependencies ,feature)
+                (+ (emtas--low-order 1) (* idx 1e-9))))
            (emtas--schedule-action
             `(require ,feature)
-            (emtas--low-order 1))))))
+            (emtas--low-order 1))))
+        (`(,order . (require ,feature))
+         (if emtas--require-instrumented-p
+             (require feature)
+           (cl-letf* ((require (symbol-function #'require))
+                      ((symbol-function #'require)
+                       (lambda (feature &optional filename noerror)
+                         ;; Two scans of the `features' list, yes, but
+                         ;; it's "probably" not a bottleneck.
+                         (unless (featurep feature)
+                           (when emtas--current-feature
+                             ;; Yes, it's okay to push onto a hash
+                             ;; table entry that doesn't exist yet.
+                             ;; You get a list with one element.
+                             (push feature (gethash
+                                            emtas--current-feature
+                                            emtas--feature-dependencies)))
+                           (let ((emtas--current-feature feature))
+                             (funcall require feature filename noerror))))))
+             (let ((emtas--require-instrumented-p t))
+               (require feature)))))
+        (`(,order . (compute-dependencies ,feature))
+         (setf (alist-get feature emtas--cache)
+               (emtas--compute-dependencies feature))
+         (setq emtas--cache-dirty t))))
     (when (or emtas--idle-queue emtas--cache-dirty)
       (run-with-idle-timer
        emtas-idle-queue-delay
