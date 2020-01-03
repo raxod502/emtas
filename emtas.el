@@ -180,11 +180,17 @@ avoid infinite recursion."
         (`(,_ . (require ,feature))
          (emtas--log "require %S" feature)
          (if emtas--require-instrumented-p
-             (require feature)
+             (require feature nil 'noerror)
            (cl-letf* ((require (symbol-function #'require))
                       ((symbol-function #'require)
                        (lambda (feature &optional filename noerror)
-                         (when emtas--current-feature
+                         (when (and emtas--current-feature
+                                    ;; If FILENAME is specified,
+                                    ;; something funky is going on. We
+                                    ;; encourage people not to do
+                                    ;; that, so we don't handle that
+                                    ;; case.
+                                    (not filename))
                            ;; Yes, it's okay to push onto a hash table
                            ;; entry that doesn't exist yet. You get a
                            ;; list with one element.
@@ -198,7 +204,7 @@ avoid infinite recursion."
                          (let ((emtas--current-feature feature))
                            (funcall require feature filename noerror)))))
              (let ((emtas--require-instrumented-p t))
-               (require feature)))))
+               (require feature nil 'noerror)))))
         (`(,_ . (compute-dependencies ,feature))
          (emtas--log "compute dependencies of %S" feature)
          (setf (alist-get feature emtas--cache)
