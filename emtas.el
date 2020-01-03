@@ -113,12 +113,12 @@ idle timer scheduled to pop something off the queue.")
   "Execute an action from the idle queue, and schedule another pop."
   (let ((emtas--inhibit-scheduling t)
         (start-time (current-time)))
-    (while (and (or emtas--idle-queue emtas--cache-dirty)
+    (while (and (or (not (heap-empty emtas--idle-queue)) emtas--cache-dirty)
                 (< (float-time (time-subtract (current-time) start-time))
                    emtas-idle-action-max-duration))
       (pcase (heap-delete-root emtas--idle-queue)
         (`nil
-         (unless emtas--idle-queue
+         (when (heap-empty emtas--idle-queue)
            ;; Looks like we popped everything off the queue, so the
            ;; cache must be dirty (otherwise we'd not be in the loop).
            ;; Better write it to disk. Then we'll be done.
@@ -180,14 +180,15 @@ idle timer scheduled to pop something off the queue.")
          (setf (alist-get feature emtas--cache)
                (emtas--compute-dependencies feature))
          (setq emtas--cache-dirty t))))
-    (when (or emtas--idle-queue emtas--cache-dirty)
+    (when (or (not (heap-empty emtas--idle-queue)) emtas--cache-dirty)
       (run-with-idle-timer
        emtas-idle-queue-delay
        nil #'emtas--pop-action-and-reschedule))))
 
 (defun emtas--schedule-action (action order)
   "Schedule an ACTION on the idle queue."
-  (unless (and emtas--idle-queue (not emtas--inhibit-scheduling))
+  (unless (and (not (heap-empty emtas--idle-queue))
+               (not emtas--inhibit-scheduling))
     (run-with-idle-timer
      emtas-idle-queue-delay
      nil #'emtas--pop-action-and-reschedule))
