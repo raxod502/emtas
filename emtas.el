@@ -6,7 +6,7 @@
 ;; Created: 2 Jan 2020
 ;; Homepage: https://github.com/raxod502/emtas
 ;; Keywords: convenience
-;; Package-Requires: ((emacs "25.1") (heap "0.5"))
+;; Package-Requires: ((emacs "25.1") (heap "0.5") (queue "0.2"))
 ;; Version: 0
 
 ;;; Commentary:
@@ -109,22 +109,20 @@ idle timer scheduled to pop something off the queue.")
 (defvar emtas--feature-dependencies (make-hash-table :test #'eq)
   "Hash table mapping features to lists of their dependencies.")
 
-(defun emtas--compute-dependencies (feature &optional table)
-  "Compute list of FEATURE's transitive dependencies in forward order.
-TABLE is a boolean hash table of features to ignore, used to
-avoid infinite recursion."
-  (setq table (or table (make-hash-table :test #'eq)))
-  ;; Perfectly safe to use recursion here since if the load depth were
-  ;; too large we'd have overflowed the stack while loading the code
-  ;; in the first place!
-  (unless (gethash feature table)
-    (puthash feature t table)
-    (cons feature
-          (apply #'append
-                 (mapcar
-                  (lambda (feature)
-                    (emtas--compute-dependencies feature table))
-                  (gethash feature emtas--feature-dependencies))))))
+(defun emtas--compute-dependencies (feature)
+  "Compute list of FEATURE's transitive dependencies in load order."
+  (let ((seen (make-hash-table :test #'eq))
+        (queue (make-queue))
+        (deps nil))
+    (queue-enqueue queue feature)
+    (while (not (queue-empty queue))
+      (let ((feature (queue-dequeue queue)))
+        (unless (gethash seen feature)
+          (puthash feature t seen)
+          (push feature deps)
+          (dolist (feature (gethash feature emtas--feature-dependencies))
+            (queue-enqueue queue feature)))))
+    (nreverse deps)))
 
 (defun emtas--pop-action-and-reschedule ()
   "Execute an action from the idle queue, and schedule another pop."
@@ -208,7 +206,7 @@ avoid infinite recursion."
         (`(,_ . (compute-dependencies ,feature))
          (emtas--log "compute dependencies of %S" feature)
          (setf (alist-get feature emtas--cache)
-               (reverse (emtas--compute-dependencies feature)))
+               (emtas--compute-dependencies feature))
          (setq emtas--cache-dirty t))
         (action (error "unknown entry in action queue: %S" action))))
     (when (or (not (heap-empty emtas--idle-queue)) emtas--cache-dirty)
