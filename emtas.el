@@ -6,7 +6,7 @@
 ;; Created: 2 Jan 2020
 ;; Homepage: https://github.com/raxod502/emtas
 ;; Keywords: convenience
-;; Package-Requires: ((emacs "25.1") (heap "0.5") (queue "0.2"))
+;; Package-Requires: ((emacs "25.1") (heap "0.5"))
 ;; Version: 0
 
 ;;; Commentary:
@@ -40,68 +40,40 @@
   (require 'heap))
 
 (defgroup emtas nil
-  "Like a tool-assisted speedrun, but for Emacs startup time."
+  "Helping you make your Emacs startup time absurdly fast, since 2019."
   :group 'convenience
   :prefix "emtas-"
   :link '(url-link "https://github.com/raxod502/emtas"))
 
-(defcustom emtas-idle-queue-delay 0.01
-  "Number of seconds to wait between each idle action."
+(defcustom emtas-idle-require-delay 0.1
+  "Number of seconds to wait between each idle `require'."
   :type 'number)
 
-(defcustom emtas-idle-action-max-duration 0.01
-  "How long EMTAS will do idle work before returning control, in seconds.
-This should be significantly less than the maximum delay you can
-deal with. Research suggests that humans start to notice software
-latency somewhere in the ballpark of 100ms."
+(defcustom emtas-max-desired-require-latency 0.1
+  "Longest number of seconds an idle `require' should take."
   :type 'number)
 
-(defcustom emtas-cache-file
-  (expand-file-name "var/emtas-cache.el" user-emacs-directory)
-  "File in which to cache feature dependency tree.
-See `emtas-idle-require'."
-  :type 'file)
+(defvar emtas--idle-require-queue
+  (make-heap (lambda (a b)
+               (or (< (nth 0 a) (nth 0 b))
+                   (and (= (nth 0 a) (nth 0 b))
+                        (< (nth 1 a) (nth 1 b))))))
+  "Priority queue of features to `require'.
+The elements are lists of three elements (ORDER SERIAL FEATURE).
+ORDER is the numerical order passed to `emtas-idle-require'.
+SERIAL is an integer that is incremented each time the same ORDER
+is used, so that ORDER and SERIAL together establish a total
+ordering on elements of the queue. FEATURE is the name of the
+feature to `require', a symbol.
 
-(defcustom emtas-verbose nil
-  "Non-nil means to verbosely log debugging information.
-This may help you to understand what EMTAS is doing during
-startup."
-  :type 'boolean)
+Invariant: the queue is non-empty if and only if there's an idle
+timer scheduled for `emtas--process-idle-require-queue'.")
 
-(defun emtas--log (format-string &rest args)
-  "Like `message', but only if `emtas-verbose', and with a prefix."
-  (when emtas-verbose
-    (apply #'message (concat "EMTAS: " format-string) args)))
-
-(defvar emtas--cache-loaded nil
-  "Non-nil means `emtas-cache-file' has been loaded.")
-
-(defvar emtas--cache-dirty nil
-  "Non-nil means cache was modified since `emtas-cache-file' was written.")
-
-(defvar emtas--cache nil
-  "The EMTAS cache, loaded from `emtas-cache-file'.
-Currently this is just an alist mapping idle-required features to
-their transitive dependencies in reverse order.")
-
-(defvar emtas--idle-queue (make-heap (lambda (a b) (< (car a) (car b))))
-  "Priority queue of actions to perform. They have an arbitrary format.
-
-Invariant: this variable is non-nil if and only if there's an
-idle timer scheduled to pop something off the queue.")
-
-(defvar emtas--inhibit-scheduling nil
-  "Non-nil means `emtas--schedule-action' never sets an idle timer.")
-
-(defun emtas--low-order (order)
-  "Return an order value lower than any the user is allowed to provide."
-  (- order 2000))
-
-(defvar emtas--idle-features-for-cache nil
-  "List of features that should be written into the cache.")
-
-(defvar emtas--require-instrumented-p nil
-  "Non-nil means `require' has been instrumented by EMTAS.")
+(defvar emtas--idle-require-serial-table (make-hash-table :test #'eql)
+  "Table of serial numbers used in `emtas--idle-require-queue'.
+The keys are ORDER values passed to `emtas-idle-require', while
+the values are the serial numbers, starting at 0 and
+increasing.")
 
 (defvar emtas--current-feature nil
   "Feature currently being required, a symbol.")
@@ -109,141 +81,32 @@ idle timer scheduled to pop something off the queue.")
 (defvar emtas--feature-dependencies (make-hash-table :test #'eq)
   "Hash table mapping features to lists of their dependencies.")
 
-(defun emtas--compute-dependencies (feature)
-  "Compute list of FEATURE's transitive dependencies in load order."
-  (let ((seen (make-hash-table :test #'eq))
-        (queue (make-queue))
-        (deps nil))
-    (queue-enqueue queue feature)
-    (while (not (queue-empty queue))
-      (let ((feature (queue-dequeue queue)))
-        (unless (gethash seen feature)
-          (puthash feature t seen)
-          (push feature deps)
-          (dolist (feature (gethash feature emtas--feature-dependencies))
-            (queue-enqueue queue feature)))))
-    (nreverse deps)))
+(defun emtas--process-idle-require-queue ()
+  "Require a feature the idle queue, and reschedule this function if needed."
+  (cl-destructuring-bind (_order _serial feature)
+      (heap-delete-root emtas--idle-require-queue)
+    (require 'feature))
+  (unless (heap-empty emtas--idle-require-queue)
+    (run-with-idle-timer
+     emtas-idle-require-delay nil
+     #'emtas--process-idle-require-queue)))
 
-(defun emtas--pop-action-and-reschedule ()
-  "Execute an action from the idle queue, and schedule another pop."
-  (let ((emtas--inhibit-scheduling t)
-        (start-time (current-time)))
-    (while (and (or (not (heap-empty emtas--idle-queue)) emtas--cache-dirty)
-                (< (float-time (time-subtract (current-time) start-time))
-                   emtas-idle-action-max-duration))
-      (pcase (heap-delete-root emtas--idle-queue)
-        (`nil
-         (when (heap-empty emtas--idle-queue)
-           (emtas--log "write cache file")
-           ;; Looks like we popped everything off the queue, so the
-           ;; cache must be dirty (otherwise we'd not be in the loop).
-           ;; Better write it to disk. Then we'll be done.
-           (cl-assert emtas--cache-loaded)
-           (cl-assert emtas--cache-dirty)
-           (make-directory (file-name-directory emtas-cache-file) 'parents)
-           (with-temp-file emtas-cache-file
-             (let ((print-level nil)
-                   (print-length nil))
-               (print emtas--cache (current-buffer))))
-           (setq emtas--cache-dirty nil)))
-        (`(,_ . load-cache)
-         (unless emtas--cache-loaded
-           (emtas--log "read cache file")
-           (with-temp-buffer
-             (ignore-errors
-               (insert-file-contents-literally
-                emtas-cache-file)
-               (setq emtas--cache (read (current-buffer)))))
-           (setq emtas--cache-loaded t)
-           (setq emtas--cache-dirty nil)))
-        (`(,_ . (idle-require ,feature))
-         (if-let ((deps (alist-get feature emtas--cache)))
-             (let ((idx 0))
-               (emtas--log "schedule reverse load of %S" feature)
-               (dolist (dep deps)
-                 (emtas--schedule-action
-                  `(require ,dep)
-                  ;; This acts as a lexicographic sort assuming no
-                  ;; instance of Emacs has more than a million
-                  ;; features available.
-                  (+ (emtas--low-order 1) (* idx 1e-6)))
-                 (cl-incf idx)))
-           (emtas--log "schedule discovery load of %S" feature)
-           (emtas--schedule-action
-            `(require ,feature)
-            (emtas--low-order 1)))
-         (emtas--schedule-action
-          `(compute-dependencies ,feature)
-          (emtas--low-order 2)))
-        (`(,_ . (require ,feature))
-         (emtas--log "require %S" feature)
-         (if emtas--require-instrumented-p
-             (require feature nil 'noerror)
-           (cl-letf* ((require (symbol-function #'require))
-                      ((symbol-function #'require)
-                       (lambda (feature &optional filename noerror)
-                         (when (and emtas--current-feature
-                                    ;; If FILENAME is specified,
-                                    ;; something funky is going on. We
-                                    ;; encourage people not to do
-                                    ;; that, so we don't handle that
-                                    ;; case.
-                                    (not filename))
-                           ;; Yes, it's okay to push onto a hash table
-                           ;; entry that doesn't exist yet. You get a
-                           ;; list with one element.
-                           (emtas--log
-                            "record dependency %S -> %S"
-                            emtas--current-feature feature)
-                           (push feature
-                                 (gethash
-                                  emtas--current-feature
-                                  emtas--feature-dependencies)))
-                         (let ((emtas--current-feature feature))
-                           (funcall require feature filename noerror)))))
-             (let ((emtas--require-instrumented-p t))
-               (require feature nil 'noerror)))))
-        (`(,_ . (compute-dependencies ,feature))
-         (emtas--log "compute dependencies of %S" feature)
-         (setf (alist-get feature emtas--cache)
-               (emtas--compute-dependencies feature))
-         (setq emtas--cache-dirty t))
-        (action (error "unknown entry in action queue: %S" action))))
-    (when (or (not (heap-empty emtas--idle-queue)) emtas--cache-dirty)
-      (run-with-idle-timer
-       emtas-idle-queue-delay
-       nil #'emtas--pop-action-and-reschedule))))
-
-(defun emtas--schedule-action (action order)
-  "Schedule an ACTION on the idle queue."
-  (unless (and (not (heap-empty emtas--idle-queue))
-               (not emtas--inhibit-scheduling))
+(defun emtas-idle-require (feature &optional order)
+  "Call `require' on FEATURE when Emacs is idle.
+ORDER defaults to 0 and can be used to establish an ordering;
+features are processed in order of increasing ORDER, with ties
+broken by the order in which `emtas-idle-require' is called."
+  (when (heap-empty emtas--idle-queue)
     (run-with-idle-timer
      emtas-idle-queue-delay
      nil #'emtas--pop-action-and-reschedule))
-  (heap-add emtas--idle-queue (cons order action)))
-
-(defun emtas-idle-require (feature &optional order)
-  "Require FEATURE when idle, amortizing load time of dependencies.
-The first time you call `emtas-idle-require', it will act the
-same as `require', but it will record data about the feature
-dependency graph and store it in `emtas-cache-file'. The next
-time, it will load the features in reverse dependency order,
-which means the editor UI will never be blocked waiting for a
-whole bunch of features to load at the same time. If the
-dependency graph changes, this will be detected automatically
-within one restart of Emacs.
-
-Idle requires with a smaller ORDER (defaults to 0) will happen
-first. ORDER must be an integer between -1000 and +1000, as other
-values are for internal use."
-  (setq order (or order 0))
-  (unless (and (integerp order)
-               (>= order -1000)
-               (<= order +1000))
-    (error "EMTAS: illegal idle-require order: %S" order))
-  (emtas--schedule-action 'load-cache (emtas--low-order 0))
-  (emtas--schedule-action `(idle-require ,feature) (or order 0)))
+  (heap-add emtas--idle-queue
+            (list order
+                  (cl-incf (gethash
+                            order
+                            emtas--idle-require-serial-table
+                            0))
+                  feature)))
 
 (provide 'emtas)
 
@@ -252,4 +115,4 @@ values are for internal use."
 ;; outline-regexp: ";;;;* "
 ;; End:
 
-;;; selectrum.el ends here
+;;; emtas.el ends here
