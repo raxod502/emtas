@@ -75,12 +75,6 @@ The keys are ORDER values passed to `emtas-idle-require', while
 the values are the serial numbers, starting at 0 and
 increasing.")
 
-(defvar emtas--current-feature nil
-  "Feature currently being required, a symbol.")
-
-(defvar emtas--feature-dependencies (make-hash-table :test #'eq)
-  "Hash table mapping features to lists of their dependencies.")
-
 (defun emtas--process-idle-require-queue ()
   "Require a feature the idle queue, and reschedule this function if needed."
   (cl-destructuring-bind (_order _serial feature)
@@ -107,6 +101,50 @@ broken by the order in which `emtas-idle-require' is called."
                             emtas--idle-require-serial-table
                             0))
                   feature)))
+
+(defvar emtas--current-feature nil
+  "Feature currently being required, a symbol.")
+
+(defvar emtas--load-time-table nil
+  "Hash table mapping loaded features to their total load time.")
+
+(defvar emtas--dependency-table nil
+  "Hash table mapping loaded features to lists of their dependencies.
+The list for nil is the list of top-level features that were
+loaded.")
+
+(defun emtas--instrument-require (require feature &optional filename noerror)
+  "Advice for `require' that collects timing and dependency information."
+  (let ((was-loaded (not (featurep feature)))
+        (start-time (current-time)))
+    (when (let ((emtas--current-feature feature))
+            (funcall require feature filename noerror))
+      (prog1 feature
+        (puthash
+         feature
+         (float-time
+          (time-subtract (current-time) start-time))
+         emtas--load-time-table)
+        (when was-loaded
+          (push
+           feature (gethash emtas--current-feature emtas--dependency-table)))))))
+
+(defun emtas-profile-start ()
+  "Start benchmarking the performance of loading features.
+After calling this function, do something that causes features to
+be loaded, and call `emtas-profile-finish'."
+  (interactive)
+  (setq emtas--load-time-table (make-hash-table :test #'eq))
+  (setq emtas--dependency-table (make-hash-table :test #'eq))
+  (advice-add #'require :around #'emtas--instrument-require))
+
+(defun emtas-profile-finish ()
+  "Finish benchmarking the performance of loading features.
+Display a sequence of `emtas-idle-require' calls that will
+effectively amortize the load time, based on the setting of
+`emtas-max-desired-require-latency'."
+  (interactive)
+  (advice-remove #'require #'emtas--instrument-require))
 
 (provide 'emtas)
 
