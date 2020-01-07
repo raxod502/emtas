@@ -115,17 +115,18 @@ loaded.")
 
 (defun emtas--instrument-require (require feature &optional filename noerror)
   "Advice for `require' that collects timing and dependency information."
-  (let ((was-loaded (not (featurep feature)))
-        (start-time (current-time)))
-    (when (let ((emtas--current-feature feature))
-            (funcall require feature filename noerror))
-      (prog1 feature
-        (puthash
-         feature
-         (float-time
-          (time-subtract (current-time) start-time))
-         emtas--load-time-table)
-        (when was-loaded
+  (let* ((needed-load (not (featurep feature)))
+         (start-time (current-time))
+         (emtas--current-feature feature)
+         (result (funcall require feature filename noerror)))
+    (prog1 result
+      (let ((was-loaded (featurep feature)))
+        (when (and needed-load was-loaded)
+          (puthash
+           feature
+           (float-time
+            (time-subtract (current-time) start-time))
+           emtas--load-time-table)
           (push
            feature (gethash emtas--current-feature emtas--dependency-table)))))))
 
